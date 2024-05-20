@@ -1,9 +1,15 @@
 use std::{
     fmt,
     ops::{Add, AddAssign, Mul},
+    sync::mpsc::{self, Sender},
+    thread,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::anyhow;
+
+use crate::{dot_product, Vector};
+
+const NUM_THREADS: usize = 4;
 
 #[warn(dead_code)]
 pub struct Matrix<T> {
@@ -12,22 +18,89 @@ pub struct Matrix<T> {
     col: usize,
 }
 
-#[allow(dead_code)]
-pub fn multiply<T>(a: &Matrix<T>, b: &Matrix<T>) -> Result<Matrix<T>>
+pub struct MsgInput<T> {
+    index: usize,
+    row_vec: Vector<T>,
+    col_vec: Vector<T>,
+}
+
+pub struct MsgOutput<T> {
+    index: usize,
+    val: T,
+}
+
+pub struct Msg<T> {
+    input: MsgInput<T>,
+    sender: oneshot::Sender<MsgOutput<T>>,
+}
+
+impl<T> Mul for Matrix<T>
 where
-    T: Add<Output = T> + Mul<Output = T> + AddAssign + Copy + Default,
+    T: Add<Output = T> + Mul<Output = T> + AddAssign + Copy + Default + Send + 'static,
+{
+    type Output = Matrix<T>;
+
+    fn mul(self, rhs: Self) -> Self::Output {
+        multiply(&self, &rhs).unwrap()
+    }
+}
+
+// pretend this is a heavy operation, CPU intensive
+#[allow(dead_code)]
+pub fn multiply<T>(a: &Matrix<T>, b: &Matrix<T>) -> anyhow::Result<Matrix<T>>
+where
+    T: Add<Output = T> + Mul<Output = T> + AddAssign + Copy + Default + Send + 'static,
 {
     if a.col != b.row {
         return Err(anyhow!("Matrix multiply error: a.col != b.row"));
     }
+
+    let senders = (0..NUM_THREADS)
+        .map(|_| {
+            let (tx, rx) = mpsc::channel::<Msg<T>>();
+            thread::spawn(move || {
+                for msg in rx {
+                    let value = dot_product(msg.input.col_vec, msg.input.row_vec)?;
+                    if let Err(e) = msg.sender.send(MsgOutput {
+                        index: msg.input.index,
+                        val: value,
+                    }) {
+                        eprintln!("Send error: {:?}", e);
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            });
+            tx
+        })
+        .collect::<Vec<Sender<Msg<T>>>>();
+
     let mut data: Vec<T> = vec![T::default(); a.row * b.col];
+    let mut receivers = Vec::with_capacity(a.row * b.col);
     for i in 0..a.row {
         for j in 0..b.col {
-            for k in 0..a.col {
-                data[i * b.col + j] += a.data[i * a.col + k] * b.data[k * b.col + j];
+            let row_vector = Vector::new(&a.data[i * a.col..(i + 1) * a.col]);
+            let col_data = b.data[j..]
+                .iter()
+                .step_by(b.col)
+                .copied()
+                .collect::<Vec<_>>();
+            let col_vector = Vector::new(col_data);
+            let idx = i * b.col + j;
+            let input = MsgInput::new(idx, row_vector, col_vector);
+            let (tx, rx) = oneshot::channel();
+            let msg = Msg::new(input, tx);
+            if let Err(e) = senders[idx % NUM_THREADS].send(msg) {
+                eprintln!("Send error: {:?}", e)
             }
+            receivers.push(rx);
         }
     }
+
+    for rx in receivers {
+        let output = rx.recv()?;
+        data[output.index] = output.val;
+    }
+
     Ok(Matrix {
         data,
         row: a.row,
@@ -84,17 +157,33 @@ where
     }
 }
 
+impl<T> MsgInput<T> {
+    pub fn new(idx: usize, row: Vector<T>, col: Vector<T>) -> Self {
+        Self {
+            index: idx,
+            row_vec: row,
+            col_vec: col,
+        }
+    }
+}
+
+impl<T> Msg<T> {
+    pub fn new(input: MsgInput<T>, sender: oneshot::Sender<MsgOutput<T>>) -> Self {
+        Self { input, sender }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use anyhow::Ok;
 
-    use super::{multiply, Matrix};
+    use super::Matrix;
 
     #[test]
     fn test_matrix_multiply() -> anyhow::Result<()> {
         let a = Matrix::new([1, 2, 3, 4, 5, 6], 2, 3);
         let b = Matrix::new([1, 2, 3, 4, 5, 6], 3, 2);
-        let c = multiply(&a, &b).unwrap();
+        let c = a * b;
         assert_eq!(
             format!("{:?}", c),
             "Matrix(row = 2, col = 2, {22 28, 49 64})"
@@ -106,11 +195,19 @@ mod tests {
     fn test_matrix_display() -> anyhow::Result<()> {
         let a = Matrix::new([1, 2, 3, 4], 2, 2);
         let b = Matrix::new([1, 2, 3, 4], 2, 2);
-        let c = multiply(&a, &b).unwrap();
+        let c = a * b;
         assert_eq!(
             format!("{:?}", c),
             "Matrix(row = 2, col = 2, {7 10, 15 22})"
         );
         Ok(())
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_a_can_not_multiply_b_panic() {
+        let a = Matrix::new([1, 2, 3, 4, 5, 6], 2, 3);
+        let b = Matrix::new([1, 2, 3, 4], 2, 2);
+        let _c = a * b;
     }
 }
